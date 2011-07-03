@@ -1,124 +1,123 @@
-
-http = require "http"
-exec = require('child_process').exec
-fs = require "fs"
-path = require "path"
-
-
-io = require "socket.io"
-cli = require( "cli")
-Inotify = require('inotify').Inotify
-
-DIR = path.join process.env['HOME'], ".textareaserver"
+http     = require("http")
+exec     = require('child_process').exec
+fs       = require("fs")
+path     = require("path")
+socketio = require("socket.io")
+cli      = require( "cli")
+Inotify  = require('inotify').Inotify
 
 
-try
-  stats = fs.realpathSync DIR
-catch error
-  fs.mkdirSync DIR,0777
-
-for file in fs.readdirSync DIR
-  fs.unlink path.join DIR, file
-
-
-
-
+# CLI options
 cli.parse
-  port: ['p', "Port to listen", "number", 32942 ]
-  host: ['l', "Host to listen", "string", "127.0.0.1"]
-  "editor-cmd": ['c', 'Editor to use. {file} will substituted with the file path. Use quotes.',
-            "string", "gedit {file}"]
-
-
-
-inotify = new Inotify()
-server = http.createServer (req, res) ->
-  res.writeHead(200, {'Content-Type': 'text/html'})
-  res.end('<h1>Hello world</h1>')
-
-socket = io.listen server, transports: ['websocket']
-
-
-
-clients = {}
-
-
+  port:   ['p', "Port to listen", "number", 32942 ]
+  host:   ['l', "Host to listen", "string", "127.0.0.1"]
+  editor: [
+    'c',
+    "Editor to use. {file} will substituted with the file path. Use quotes.",
+    "string", "gedit {file}"
+  ]
 
 cleanUuid = (uuid) ->
   # Make sure that there are no funny characters
   uuid.replace(/[^a-zA-Z0-9_\-]/g, "")
 
-inotify.addWatch
-  path: DIR
-  watch_for: Inotify.IN_CLOSE_WRITE
-  callback: (event) ->
-    fs.readFile (path.join DIR, event.name), (err, data) ->
+class Server
 
-      client = clients[event.name]
+  constructor: (@options = {}) ->
+    @clients = {}
+    @dir = path.join(process.env['HOME'], ".textareaserver")
 
-      if client
-        msg =
-          textarea: data.toString()
-          uuid: event.name
-        client.send JSON.stringify msg
+  run: =>
+    @_setupDirectory()
+    @_watchDirectory()
 
+    console.log "Starting server..."
 
-actions =
+    app = http.createServer (req, res) ->
+      res.writeHead(200); res.end('This is your TextareaServer.')
 
-  delete: (client, msg) ->
+    io = socketio.listen(app, transports: ['websocket'])
+    io.sockets.on 'connection', @onConnection
 
+    console.log "Binding to #{@options.host}:#{@options.port}"
+
+    app.listen(@options.port, @options.host)
+
+  # Makes sure that the directory exists and is clean.
+  _setupDirectory: =>
+    # Create directory if it does not exist yet.
+    try
+      stats = fs.realpathSync @dir
+    catch error
+      fs.mkdirSync @dir, 0777
+
+    # Remove all existing files.
+    for file in fs.readdirSync @dir
+      fs.unlink path.join @dir, file
+
+  # Uses inotify to watch the directory.
+  _watchDirectory: =>
+    console.log "Start watching directory #{@dir}"
+
+    @inotify = new Inotify()
+    @inotify.addWatch
+      path: @dir
+      watch_for: Inotify.IN_CLOSE_WRITE
+      callback: @onFileWrite
+
+  # Called when a client connects.
+  onConnection: (socket) =>
+    socket.on 'open',   (args...) => @onOpen(socket, args...)
+    socket.on 'delete', (args...) => @onDelete(socket, args...)
+    socket.on 'disconnect', @onDisconnect
+
+    null
+
+  # Called by the client.
+  onOpen: (socket, msg) =>
+    @clients[msg.uuid] = socket
+
+    file = path.join @dir, cleanUuid msg.uuid
+
+    fs.writeFile file, msg.textarea, =>
+      if msg.spawn
+
+        fileRegx = /\{ *file *\}/
+        editorCmd = @options.editor
+
+        if !! editorCmd.match fileRegx
+          cmd = editorCmd.replace(fileRegx, file)
+        else
+          cmd = "#{editorCmd.trim()} #{file}"
+
+        console.log "Opening editor: #{cmd}"
+
+        editor = exec(cmd)
+
+  # Called by the client.
+  onDelete: (socket, msg) =>
     for uuid in msg.uuids
-      delete clients[uuid]
-      console.log path.join DIR, uuid
-      fs.unlink path.join DIR, uuid
+      delete @clients[uuid]
+      console.log path.join @dir, uuid
+      fs.unlink path.join @dir, uuid
 
-
-socket.on 'connection', (client) ->
-  client.on 'message', (msg) ->
-    msg = JSON.parse msg
-
-
-    action = actions[msg.action]
-    if action
-      action client, msg
-    else
-      console.log "Bad action " + msg.action
-
-  client.on 'disconnect', ->
+  # Called when a socket closes.
+  onDisconnect: ->
     console.log "browser disconnected"
 
+  # Called when inotify detects a write.
+  onFileWrite: (event) =>
+    client = @clients[event.name]
+
+    return unless client
+
+    fs.readFile path.join(@dir, event.name), (err, data) ->
+      msg = textarea: data.toString(), uuid: event.name
+      client.send JSON.stringify(msg)
 
 exports.run = ->
 
   cli.main (args, options) ->
-    actions.open =  (client, msg) ->
 
-      clients[msg.uuid] = client
-
-      file = path.join DIR, cleanUuid msg.uuid
-
-      fs.writeFile file, msg.textarea, ->
-        if msg.spawn
-
-          fileRegx = /\{ *file *\}/
-          editorCmd = options["editor-cmd"]
-
-          if !! editorCmd.match fileRegx
-            cmd = editorCmd.replace(fileRegx, file)
-          else
-            cmd = "#{editorCmd.trim()} #{file}"
-
-          console.log cmd
-
-          editor = exec cmd
-
-
-
-    try
-      server.listen options.port, options.host
-      console.log "TextareaServer is running at #{options.host}:#{options.port}"
-    catch error
-      console.log "Could not start the server: #{ error.message }"
-      process.exit 1
-
-
+    server = new Server(options)
+    server.run()
